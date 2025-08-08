@@ -1,0 +1,4 @@
+streamlit
+pillow
+openai
+azure-ai-documentintelligence
