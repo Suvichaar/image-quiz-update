@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
@@ -124,7 +125,7 @@ Mapping rules:
 - sNattachment1 ← explanation for that question
 - sNquestionHeading ← "प्रश्न {N-1}"
 - pagetitle/storytitle: derive short, relevant Hindi titles from the overall content.
-- typeofquiz: set "शैक्षिक" if unknown.
+- typeofquiz: set "শैक्षिक" if unknown.
 - s1title1: a 2–5 word intro title; s1text1: 1–2 sentence intro.
 - results_*: short friendly Hindi strings. results_bg_image: "" if none.
 
@@ -229,6 +230,14 @@ def fill_template(template: str, data: dict) -> str:
     return html
 
 
+def render_html_preview(html_str: str, height: int = 900):
+    """
+    Try to render the generated HTML inside Streamlit.
+    Note: AMP pages may not fully render due to sandbox/CSP, but we'll attempt a best-effort preview.
+    """
+    components.html(html_str, height=height, scrolling=True)
+
+
 # ---------------------------
 # 🧩 All-in-one Builder UI
 # ---------------------------
@@ -306,9 +315,18 @@ with tab_all:
             Path(ts_name).write_text(final_html, encoding="utf-8")
 
             st.success(f"✅ Final HTML generated and saved as **{ts_name}**")
+
+            # 🔍 Source preview (always safe)
             with st.expander("🔍 HTML Preview (source)"):
                 st.code(final_html[:120000], language="html")
 
+            # 🖼️ Live HTML viewer (best-effort)
+            st.markdown("### 🖼️ Live Preview (best effort)")
+            st.caption("Note: AMP pages may not fully render in this viewer due to sandbox/CSP. Download to test in a browser.")
+            render_height = st.slider("Preview height (px)", min_value=400, max_value=1600, value=900, step=50)
+            render_html_preview(final_html, height=render_height)
+
+            # ⬇️ Download
             st.download_button(
                 "⬇️ Download final HTML",
                 data=final_html.encode("utf-8"),
@@ -316,7 +334,7 @@ with tab_all:
                 mime="text/html"
             )
 
-            st.info("AMP pages often won’t render inside Streamlit due to sandboxing/CSP. Download and open locally or deploy.")
+            st.info("If the preview looks blank, that’s likely AMP sandboxing. Download and open locally or deploy to view.")
         except Exception as e:
             st.error(f"Build failed: {e}")
     elif not (questions_data and up_tpl):
