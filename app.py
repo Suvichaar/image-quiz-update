@@ -7,6 +7,13 @@
 #   AZURE_OPENAI_API_VERSION="2024-08-01-preview"
 #   AZURE_OPENAI_API_KEY="<azure openai key>"
 #   GPT_DEPLOYMENT="gpt-4"   # your Azure OpenAI deployment name
+#   # --- S3 / CDN ---
+#   AWS_ACCESS_KEY="<AKIA...>"
+#   AWS_SECRET_KEY="<secret>"
+#   AWS_REGION="ap-south-1"
+#   AWS_BUCKET="suvichaarapp"
+#   HTML_S3_PREFIX="webstory-html"
+#   CDN_HTML_BASE="https://cdn.suvichaar.org/"
 
 import io
 import json
@@ -20,6 +27,7 @@ from PIL import Image
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from openai import AzureOpenAI
+import boto3
 
 
 # ---------------------------
@@ -31,13 +39,14 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 OCR → GPT-4 Structuring → AMP Web Story")
-st.caption("Upload an image (OCR) or structured JSON, plus an AMP HTML template → get a timestamped final HTML.")
+st.caption("Upload an image (OCR) or structured JSON, plus an AMP HTML template → get a timestamped final HTML uploaded to S3.")
 
 
 # ---------------------------
 # Secrets / Config (from st.secrets)
 # ---------------------------
 try:
+    # Azure
     AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]      # e.g., https://<your-di>.cognitiveservices.azure.com/
     AZURE_API_KEY = st.secrets["AZURE_API_KEY"]
 
@@ -45,8 +54,17 @@ try:
     AZURE_OPENAI_API_VERSION = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
     AZURE_OPENAI_API_KEY = st.secrets.get("AZURE_OPENAI_API_KEY", AZURE_API_KEY)  # reuse if same key
     GPT_DEPLOYMENT = st.secrets.get("GPT_DEPLOYMENT", "gpt-4")
+
+    # S3/CDN
+    AWS_ACCESS_KEY = st.secrets.get("AWS_ACCESS_KEY")
+    AWS_SECRET_KEY = st.secrets.get("AWS_SECRET_KEY")
+    AWS_SESSION_TOKEN = st.secrets.get("AWS_SESSION_TOKEN")  # optional
+    AWS_REGION = st.secrets.get("AWS_REGION", "ap-south-1")
+    AWS_BUCKET = st.secrets.get("AWS_BUCKET", "suvichaarapp")
+    HTML_S3_PREFIX = st.secrets.get("HTML_S3_PREFIX", "webstory-html")
+    CDN_HTML_BASE = st.secrets.get("CDN_HTML_BASE", "https://cdn.suvichaar.org/")
 except Exception:
-    st.error("Missing secrets. Please set AZURE_DI_ENDPOINT, AZURE_API_KEY, AZURE_OPENAI_ENDPOINT, and GPT deployment details in secrets.")
+    st.error("Missing secrets. Please set Azure and S3/CDN config in .streamlit/secrets.toml")
     st.stop()
 
 
@@ -63,6 +81,45 @@ gpt_client = AzureOpenAI(
     api_version=AZURE_OPENAI_API_VERSION,
     azure_endpoint=AZURE_OPENAI_ENDPOINT,
 )
+
+@st.cache_resource(show_spinner=False)
+def s3_client():
+    kwargs = dict(
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION,
+    )
+    if AWS_SESSION_TOKEN:
+        kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    return boto3.client("s3", **kwargs)
+
+
+def s3_put_text_file(bucket: str, key: str, body: bytes, content_type: str,
+                     cache_control: str = "public, max-age=31536000, immutable"):
+    """
+    Upload small text/HTML file to S3 (NO ACL) and verify via HEAD.
+    Returns dict with ok/etag/len/error.
+    """
+    s3 = s3_client()
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=body,
+            ContentType=content_type,
+            CacheControl=cache_control,
+        )
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": len(body), "error": f"put_object failed: {e}"}
+
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        etag = head.get("ETag", "").strip('"')
+        cl = int(head.get("ContentLength", 0))
+        ok = cl == len(body)
+        return {"ok": ok, "etag": etag, "key": key, "len": cl, "error": None if ok else f"size mismatch {cl}!={len(body)}"}
+    except Exception as e:
+        return {"ok": False, "etag": None, "key": key, "len": 0, "error": f"head_object failed: {e}"}
 
 
 # ---------------------------
@@ -125,7 +182,7 @@ Mapping rules:
 - sNattachment1 ← explanation for that question
 - sNquestionHeading ← "प्रश्न {N-1}"
 - pagetitle/storytitle: derive short, relevant Hindi titles from the overall content.
-- typeofquiz: set "শैक्षिक" if unknown.
+- typeofquiz: set "शैक्षिक" if unknown.
 - s1title1: a 2–5 word intro title; s1text1: 1–2 sentence intro.
 - results_*: short friendly Hindi strings. results_bg_image: "" if none.
 
@@ -231,11 +288,16 @@ def fill_template(template: str, data: dict) -> str:
 
 
 def render_html_preview(html_str: str, height: int = 900):
-    """
-    Try to render the generated HTML inside Streamlit.
-    Note: AMP pages may not fully render due to sandbox/CSP, but we'll attempt a best-effort preview.
-    """
+    """Best-effort preview (AMP may be sandboxed)."""
     components.html(html_str, height=height, scrolling=True)
+
+
+def slugify(text: str) -> str:
+    s = (text or "webstory").strip().lower()
+    s = re.sub(r"[:/\\]+", "-", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^a-z0-9_\-\.]", "", s)
+    return s or "webstory"
 
 
 # ---------------------------
@@ -245,7 +307,7 @@ tab_all, = st.tabs(["All-in-one Builder"])
 
 with tab_all:
     st.subheader("Build final AMP HTML from image or structured JSON")
-    st.caption("Pick input source, upload AMP HTML template, and download the final HTML with a timestamped filename.")
+    st.caption("Pick input source, upload AMP HTML template, and download the final HTML with a timestamped filename (also uploaded to S3).")
 
     mode = st.radio(
         "Choose input",
@@ -310,11 +372,31 @@ with tab_all:
             # merge
             final_html = fill_template(template_html, placeholders)
 
-            # save timestamped file
-            ts_name = f"final_quiz_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            # filename: storytitle + timestamp
+            base = slugify(placeholders.get("storytitle", "webstory"))
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            ts_name = f"{base}_{ts}.html"
+
+            # save locally (optional)
             Path(ts_name).write_text(final_html, encoding="utf-8")
 
-            st.success(f"✅ Final HTML generated and saved as **{ts_name}**")
+            # upload to S3 (NO ACL) under HTML_S3_PREFIX
+            key_prefix = HTML_S3_PREFIX.strip("/")
+            s3_key = f"{key_prefix}/{ts_name}" if key_prefix else ts_name
+            with st.spinner(f"☁️ Uploading to s3://{AWS_BUCKET}/{s3_key} …"):
+                res = s3_put_text_file(
+                    bucket=AWS_BUCKET,
+                    key=s3_key,
+                    body=final_html.encode("utf-8"),
+                    content_type="text/html; charset=utf-8"
+                )
+
+            if res.get("ok"):
+                cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{s3_key}"
+                st.success(f"✅ Final HTML saved as **{ts_name}** and uploaded to S3.")
+                st.markdown(f"- **CDN URL:** {cdn_url}")
+            else:
+                st.error(f"S3 upload failed: {res.get('error','unknown error')}")
 
             # 🔍 Source preview (always safe)
             with st.expander("🔍 HTML Preview (source)"):
