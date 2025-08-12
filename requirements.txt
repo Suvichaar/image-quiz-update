@@ -2,3 +2,4 @@ streamlit
 pillow
 openai
 azure-ai-documentintelligence
+boto3
